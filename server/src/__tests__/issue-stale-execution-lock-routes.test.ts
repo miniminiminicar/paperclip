@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companies,
   createDb,
   heartbeatRuns,
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -66,11 +68,16 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     return app;
   }
 
-  async function seedCompanyAgentAndRuns() {
+  async function seedCompanyAgentAndRuns(options: {
+    agentStatus?: "active" | "paused";
+    terminalRunStatus?: "failed" | "succeeded";
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const failedRunId = randomUUID();
     const currentRunId = randomUUID();
+    const agentStatus = options.agentStatus ?? "active";
+    const terminalRunStatus = options.terminalRunStatus ?? "failed";
 
     await db.insert(companies).values({
       id: companyId,
@@ -83,7 +90,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       companyId,
       name: "CodexCoder",
       role: "engineer",
-      status: "active",
+      status: agentStatus,
       adapterType: "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
@@ -94,7 +101,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         id: failedRunId,
         companyId,
         agentId,
-        status: "failed",
+        status: terminalRunStatus,
         invocationSource: "manual",
         finishedAt: new Date(),
       },
@@ -210,6 +217,98 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       checkoutRunId: null,
       executionRunId: null,
       executionLockedAt: null,
+    });
+  });
+
+  it("clears a terminal executionRunId when resume=true reopens via POST comments", async () => {
+    const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns({
+      agentStatus: "paused",
+      terminalRunStatus: "succeeded",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Resume follow-up via comment",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      completedAt: new Date(),
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "please resume", resume: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("lets the assignee checkout immediately after resume=true on the PATCH comment path", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
+      agentStatus: "paused",
+      terminalRunStatus: "succeeded",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Resume follow-up via patch comment",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+      completedAt: new Date(),
+    });
+
+    const resumeRes = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "please resume", resume: true });
+
+    expect(resumeRes.status, JSON.stringify(resumeRes.body)).toBe(200);
+
+    const checkoutRes = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["todo", "backlog", "blocked", "in_review"] });
+
+    expect(checkoutRes.status, JSON.stringify(checkoutRes.body)).toBe(200);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_progress",
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
     });
   });
 
