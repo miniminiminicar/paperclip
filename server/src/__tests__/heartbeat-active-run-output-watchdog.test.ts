@@ -94,7 +94,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRunningRun(opts: { now: Date; ageMs: number; withOutput?: boolean; logChunk?: string }) {
+  async function seedRunningRun(opts: {
+    now: Date;
+    ageMs: number;
+    withOutput?: boolean;
+    logChunk?: string;
+    includeIssue?: boolean;
+  }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -135,18 +141,20 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         permissions: {},
       },
     ]);
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Long running implementation",
-      status: "in_progress",
-      priority: "medium",
-      assigneeAgentId: coderId,
-      issueNumber: 1,
-      identifier: `${issuePrefix}-1`,
-      updatedAt: startedAt,
-      createdAt: startedAt,
-    });
+    if (opts.includeIssue !== false) {
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Long running implementation",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        updatedAt: startedAt,
+        createdAt: startedAt,
+      });
+    }
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
@@ -159,7 +167,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       lastOutputAt,
       lastOutputSeq: opts.withOutput ? 3 : 0,
       lastOutputStream: opts.withOutput ? "stdout" : null,
-      contextSnapshot: { issueId },
+      contextSnapshot: opts.includeIssue === false ? {} : { issueId },
       stdoutExcerpt: "OPENAI_API_KEY=sk-test-secret-value should not leak",
       logBytes: 0,
     });
@@ -180,7 +188,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         })
         .where(eq(heartbeatRuns.id, runId));
     }
-    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    if (opts.includeIssue !== false) {
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    }
     return { companyId, managerId, coderId, issueId, runId, issuePrefix };
   }
 
@@ -268,6 +278,40 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(source?.status).toBe("blocked");
+  });
+
+  it("keeps standalone critical silent runs in the recovery lane instead of blocking business work", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result.created).toBe(1);
+    const [evaluation] = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluation).toMatchObject({
+      priority: "high",
+      assigneeAgentId: managerId,
+      parentId: null,
+      originId: runId,
+    });
+    expect(evaluation?.description).toContain("Source issue: none");
+
+    const relations = await db.select().from(issueRelations).where(eq(issueRelations.companyId, companyId));
+    expect(relations).toHaveLength(0);
+
+    const nonEvaluationIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), sql`${issues.originKind} is distinct from 'stale_active_run_evaluation'`));
+    expect(nonEvaluationIssues).toHaveLength(0);
   });
 
   it("skips snoozed runs and healthy noisy runs", async () => {

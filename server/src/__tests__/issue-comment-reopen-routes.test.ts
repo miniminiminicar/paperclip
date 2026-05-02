@@ -341,6 +341,21 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("reports PATCH activity back to the run so detached warnings can clear automatically", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("in_progress"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "still working", priority: "high" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.reportRunActivity).toHaveBeenCalledWith("run-1");
+  });
+
   it("implicitly reopens closed issues via the PATCH comment path when reassigning to an agent", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
@@ -478,6 +493,27 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("reports POST comment activity back to the run so detached warnings can clear automatically", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "hello from the same run",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: "22222222-2222-4222-8222-222222222222",
+      authorUserId: null,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "hello from the same run" });
+
+    expect(res.status).toBe(201);
+    expect(mockHeartbeatService.reportRunActivity).toHaveBeenCalledWith("run-1");
   });
 
   it("rejects non-assignee agent POST comments on closed issues", async () => {
