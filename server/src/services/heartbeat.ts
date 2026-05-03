@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -86,6 +86,13 @@ import {
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import {
+  buildStableIssueCommentGateSnapshot,
+  normalizeIssueCommentBodyForPolicy,
+  readStableIssueCommentPolicyMetadata,
+  shouldSuppressStableIssueComment,
+  writeStableIssueCommentPolicyMetadata,
+} from "./issue-comment-policy.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
@@ -3216,6 +3223,126 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function patchRunResultJson(
+    runId: string,
+    resultJson: Record<string, unknown> | null,
+  ) {
+    return db
+      .update(heartbeatRuns)
+      .set({
+        resultJson,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function findLatestPriorIssueScopedRun(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">,
+    issueId: string,
+  ) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        resultJson: heartbeatRuns.resultJson,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "succeeded"),
+          ne(heartbeatRuns.id, run.id),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function loadStableIssueCommentGate(
+    companyId: string,
+    issueId: string,
+  ) {
+    const issue = await db
+      .select({
+        status: issues.status,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return null;
+
+    const blockers = issue.status === "blocked"
+      ? await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.relatedIssueId, issueId),
+            ne(issues.status, "done"),
+          ),
+        )
+      : [];
+
+    return buildStableIssueCommentGateSnapshot({
+      issueStatus: issue.status,
+      executionState: issue.executionState,
+      blockers,
+    });
+  }
+
+  async function prepareStableIssueCommentPublication(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    candidateComment: string;
+    resultJson: Record<string, unknown> | null;
+  }) {
+    const gate = await loadStableIssueCommentGate(input.run.companyId, input.issueId);
+    if (!gate) {
+      return {
+        gate: null,
+        normalizedBody: null,
+        suppressed: false,
+        resultJson: input.resultJson,
+      };
+    }
+
+    const normalizedBody = normalizeIssueCommentBodyForPolicy(input.candidateComment);
+    const previousRun = await findLatestPriorIssueScopedRun(input.run, input.issueId);
+    const suppression = shouldSuppressStableIssueComment({
+      candidateBody: input.candidateComment,
+      currentGate: gate,
+      previousResultJson: previousRun?.resultJson ?? null,
+    });
+
+    if (suppression) {
+      return {
+        gate,
+        normalizedBody,
+        suppressed: true,
+        authoritativeCommentId: suppression.authoritativeCommentId,
+        resultJson: writeStableIssueCommentPolicyMetadata(input.resultJson, suppression.metadata),
+      };
+    }
+
+    return {
+      gate,
+      normalizedBody,
+      suppressed: false,
+      resultJson: input.resultJson,
+    };
+  }
+
   async function findRunIssueComment(runId: string, companyId: string, issueId: string) {
     return db
       .select({
@@ -3433,6 +3560,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueCommentStatus: "satisfied",
         issueCommentSatisfiedByCommentId: postedComment.id,
         issueCommentRetryQueuedAt: null,
+      });
+      return { outcome: "satisfied" as const, queuedRun: null };
+    }
+
+    const stablePolicy = readStableIssueCommentPolicyMetadata(run.resultJson);
+    if (stablePolicy?.suppressed && stablePolicy.authoritativeCommentId) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "satisfied",
+        issueCommentSatisfiedByCommentId: stablePolicy.authoritativeCommentId,
+        issueCommentRetryQueuedAt: null,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: `Suppressed stable ${stablePolicy.lane} issue comment because the gate and authoritative body were unchanged`,
+        payload: {
+          suppressionReason: stablePolicy.suppressionReason,
+          authoritativeCommentId: stablePolicy.authoritativeCommentId,
+          gateFingerprint: stablePolicy.fingerprint,
+        },
       });
       return { outcome: "satisfied" as const, queuedRun: null };
     }
@@ -5974,7 +6122,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             exitCode: adapterResult.exitCode,
           },
         });
-        const livenessRun = finalizedRun;
+        let livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
         if (issueId && outcome === "succeeded") {
           try {
@@ -5982,7 +6130,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             if (!existingRunComment) {
               const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
               if (issueComment) {
-                await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+                const publication = await prepareStableIssueCommentPublication({
+                  run: livenessRun,
+                  issueId,
+                  candidateComment: issueComment,
+                  resultJson: persistedResultJson,
+                });
+                if (publication.suppressed) {
+                  const updatedRun = await patchRunResultJson(livenessRun.id, publication.resultJson);
+                  if (updatedRun) livenessRun = updatedRun;
+                } else {
+                  const createdComment = await issuesSvc.addComment(issueId, issueComment, {
+                    agentId: agent.id,
+                    runId: livenessRun.id,
+                  });
+                  if (publication.gate && publication.normalizedBody) {
+                    const updatedResultJson = writeStableIssueCommentPolicyMetadata(publication.resultJson, {
+                      version: 1,
+                      lane: publication.gate.lane,
+                      fingerprint: publication.gate.fingerprint,
+                      normalizedBody: publication.normalizedBody,
+                      authoritativeCommentId: createdComment.id,
+                      suppressed: false,
+                      suppressionReason: null,
+                    });
+                    const updatedRun = await patchRunResultJson(livenessRun.id, updatedResultJson);
+                    if (updatedRun) livenessRun = updatedRun;
+                  }
+                }
               }
             }
           } catch (err) {

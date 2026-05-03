@@ -28,7 +28,9 @@ async function closeDbClient(db: ReturnType<typeof createDb> | undefined) {
   await db?.$client?.end?.({ timeout: 0 });
 }
 
-async function createControlledGatewayServer() {
+async function createControlledGatewayServer(opts?: {
+  waitPayloads?: Array<Record<string, unknown>>;
+}) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
   const agentPayloads: Array<Record<string, unknown>> = [];
@@ -104,14 +106,16 @@ async function createControlledGatewayServer() {
         if (waitCount === 1) {
           await firstWaitGate;
         }
+        const configuredPayload = opts?.waitPayloads?.[waitCount - 1] ?? {};
         socket.send(
           JSON.stringify({
             type: "res",
             id: frame.id,
             ok: true,
             payload: {
+              ...configuredPayload,
               runId: frame.params?.runId,
-              status: "ok",
+              status: typeof configuredPayload.status === "string" ? configuredPayload.status : "ok",
               startedAt: 1,
               endedAt: 2,
             },
@@ -1599,4 +1603,272 @@ describe("heartbeat comment wake batching", () => {
       await gateway.close();
     }
   }, 20_000);
+
+  it("suppresses unchanged in_review summary comments but republishes when the review gate changes", async () => {
+    const structuredSummary = [
+      "当前结论：IN_PROGRESS。review lane unchanged。",
+      "当前执行 owner：QA。",
+      "当前 gate：reviewer-watch。",
+      "下一步动作：等待 Sawyer review。",
+      "完成后回到：Sawyer。",
+    ].join("\n");
+    const gateway = await createControlledGatewayServer({
+      waitPayloads: [
+        { text: structuredSummary },
+        { text: structuredSummary },
+        { text: structuredSummary },
+      ],
+    });
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const nextReviewerId = randomUUID();
+    const issueId = randomUUID();
+    const firstStageId = randomUUID();
+    const secondStageId = randomUUID();
+    const firstDecisionId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values([
+        {
+          id: agentId,
+          companyId,
+          name: "QA Watcher",
+          role: "qa",
+          status: "idle",
+          adapterType: "openclaw_gateway",
+          adapterConfig: {
+            url: gateway.url,
+            headers: {
+              "x-openclaw-token": "gateway-token",
+            },
+            payloadTemplate: {
+              message: "wake now",
+            },
+            waitTimeoutMs: 2_000,
+          },
+          runtimeConfig: {},
+          permissions: {},
+        },
+        {
+          id: nextReviewerId,
+          companyId,
+          name: "Sawyer",
+          role: "qa",
+          status: "idle",
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        },
+      ]);
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Stable review gate",
+        status: "in_review",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionState: {
+          status: "pending",
+          currentStageId: firstStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: { instructions: "Verify the existing PR before release." },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const firstTrigger = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "reviewer-1",
+          body: "please re-check the unchanged gate",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: firstTrigger.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: firstTrigger.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "reviewer-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+      gateway.releaseFirstWait();
+      await waitFor(async () => {
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "succeeded" && run.issueCommentStatus === "satisfied";
+      });
+
+      const firstAgentComment = await db
+        .select()
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId)))
+        .orderBy(asc(issueComments.createdAt), asc(issueComments.id))
+        .then((rows) => rows[0] ?? null);
+
+      expect(firstAgentComment?.body).toBe(structuredSummary);
+
+      const secondTrigger = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "reviewer-1",
+          body: "wake again with no gate change",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const secondRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: secondTrigger.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: secondTrigger.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "reviewer-1",
+      });
+
+      expect(secondRun).not.toBeNull();
+      await waitFor(async () => {
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, secondRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "succeeded" && run.issueCommentStatus === "satisfied";
+      });
+
+      const secondRunRow = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, secondRun!.id))
+        .then((rows) => rows[0] ?? null);
+      const secondRunPolicy = (secondRunRow?.resultJson as Record<string, unknown> | null)?.issueCommentPolicy as
+        | Record<string, unknown>
+        | undefined;
+      const secondAgentComments = await db
+        .select()
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId)))
+        .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+
+      expect(secondAgentComments).toHaveLength(1);
+      expect(secondRunRow?.issueCommentSatisfiedByCommentId).toBe(firstAgentComment?.id ?? null);
+      expect(secondRunPolicy?.suppressed).toBe(true);
+
+      await db
+        .update(issues)
+        .set({
+          executionState: {
+            status: "pending",
+            currentStageId: secondStageId,
+            currentStageIndex: 1,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: nextReviewerId, userId: null },
+            returnAssignee: { type: "agent", agentId, userId: null },
+            reviewRequest: { instructions: "Verify the existing PR before release." },
+            completedStageIds: [firstStageId],
+            lastDecisionId: firstDecisionId,
+            lastDecisionOutcome: "approved",
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+
+      const thirdTrigger = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorUserId: "reviewer-2",
+          body: "gate changed, publish the delta",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const thirdRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: thirdTrigger.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: thirdTrigger.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "reviewer-2",
+      });
+
+      expect(thirdRun).not.toBeNull();
+      await waitFor(async () => {
+        const comments = await db
+          .select()
+          .from(issueComments)
+          .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId)))
+          .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+        return comments.length === 2;
+      });
+      await waitFor(async () => {
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, thirdRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "succeeded" && run.issueCommentStatus === "satisfied";
+      });
+
+      const finalAgentComments = await db
+        .select()
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId)))
+        .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+
+      expect(finalAgentComments).toHaveLength(2);
+      expect(finalAgentComments[1]?.body).toBe(structuredSummary);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 40_000);
 });
